@@ -1,14 +1,23 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { ToedoLogo } from '@/components/toedo-logo';
+import { useAuth } from '@/context/auth';
+import { supabase } from '@/lib/supabase';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Haptics from 'expo-haptics';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
+  Dimensions,
   FlatList,
+  GestureResponderEvent,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -16,9 +25,6 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { ToedoLogo } from '@/components/toedo-logo';
-import { useAuth } from '@/context/auth';
-import { supabase } from '@/lib/supabase';
 
 type Workspace = {
   id: number;
@@ -64,6 +70,14 @@ export default function HomeScreen() {
   const [showNewTodo, setShowNewTodo] = useState(false);
   const [newText, setNewText] = useState('');
   const [newTodoLoading, setNewTodoLoading] = useState(false);
+  const [showWsMenu, setShowWsMenu] = useState(false);
+  const [menuWs, setMenuWs] = useState<Workspace | null>(null);
+  const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
+  const [showEditWs, setShowEditWs] = useState(false);
+  const [editName, setEditName] = useState('');
+  const [editPublic, setEditPublic] = useState(false);
+  const [editPassword, setEditPassword] = useState('');
+  const [wsActionLoading, setWsActionLoading] = useState(false);
 
   const fetchWorkspaces = useCallback(async () => {
     if (!user) return;
@@ -226,6 +240,139 @@ export default function HomeScreen() {
     setNewText('');
   };
 
+  const closeWsMenu = () => {
+    setShowWsMenu(false);
+    setMenuWs(null);
+  };
+
+  const openWorkspaceMenu = (ws: Workspace, ev: GestureResponderEvent) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
+    setMenuWs(ws);
+    setMenuPos({ x: ev.nativeEvent.pageX, y: ev.nativeEvent.pageY });
+    setShowWsMenu(true);
+  };
+
+  const openEditWorkspace = () => {
+    if (!menuWs) return;
+    setEditName(menuWs.name);
+    setEditPublic(menuWs.is_public);
+    setEditPassword(menuWs.password ?? '');
+    setShowWsMenu(false);
+    setShowEditWs(true);
+  };
+
+  const closeEditWorkspace = () => {
+    setShowEditWs(false);
+    setEditName('');
+    setEditPublic(false);
+    setEditPassword('');
+    setMenuWs(null);
+  };
+
+  const handleUpdateWorkspace = async () => {
+    if (!menuWs || !editName.trim()) return;
+    if (menuWs.user_id !== user?.id) {
+      Alert.alert('Not allowed', 'Only the workspace owner can edit this workspace.');
+      return;
+    }
+    setWsActionLoading(true);
+    const payload = {
+      name: editName.trim(),
+      is_public: editPublic,
+      password: editPublic ? null : (editPassword.trim() || null),
+    };
+    const { data, error } = await supabase
+      .from('workspace')
+      .update(payload)
+      .eq('id', menuWs.id)
+      .select('id, name, user_id, is_public, password')
+      .single();
+
+    if (!error && data) {
+      setWorkspaces(prev => prev.map(ws => (ws.id === menuWs.id ? (data as Workspace) : ws)));
+      setMenuWs(data as Workspace);
+      setShowEditWs(false);
+    }
+    setWsActionLoading(false);
+  };
+
+  const handleToggleWorkspaceVisibility = async () => {
+    if (!menuWs) return;
+    if (menuWs.user_id !== user?.id) {
+      Alert.alert('Not allowed', 'Only the workspace owner can change visibility.');
+      return;
+    }
+    const nextPublic = !menuWs.is_public;
+    const { data, error } = await supabase
+      .from('workspace')
+      .update({ is_public: nextPublic, password: nextPublic ? null : menuWs.password })
+      .eq('id', menuWs.id)
+      .select('id, name, user_id, is_public, password')
+      .single();
+
+    if (!error && data) {
+      setWorkspaces(prev => prev.map(ws => (ws.id === menuWs.id ? (data as Workspace) : ws)));
+      setMenuWs(data as Workspace);
+    }
+    setShowWsMenu(false);
+  };
+
+  const removeJoinedWorkspace = async (wsId: number) => {
+    const raw = await AsyncStorage.getItem(JOINED_WS_KEY);
+    const ids: number[] = raw ? JSON.parse(raw) : [];
+    await AsyncStorage.setItem(JOINED_WS_KEY, JSON.stringify(ids.filter(id => id !== wsId)));
+  };
+
+  const handleDeleteWorkspace = () => {
+    if (!menuWs) return;
+    const wsToDelete = menuWs;
+    Alert.alert(
+      'Delete workspace',
+      `"${wsToDelete.name}" workspace will be removed. Are you sure?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            if (wsToDelete.user_id === user?.id) {
+              await supabase.from('workspace').delete().eq('id', wsToDelete.id);
+            } else {
+              await removeJoinedWorkspace(wsToDelete.id);
+            }
+            setWorkspaces(prev => prev.filter(ws => ws.id !== wsToDelete.id));
+            setSelectedWsId(prev => (prev === wsToDelete.id ? null : prev));
+            setShowWsMenu(false);
+            setMenuWs(null);
+          },
+        },
+      ]
+    );
+  };
+
+  const handleShareWorkspace = async () => {
+    if (!menuWs) return;
+    const shareMessage =
+      `Benim workspace'ime katil:\n` +
+      `Workspace ID: ${menuWs.id}\n` +
+      `Uygulama: ToedoMobile\n` +
+      `Uygulamaya girip "Join" bolumunden bu ID'yi yazarak katilabilirsin.`;
+
+    const waUrl = `whatsapp://send?text=${encodeURIComponent(shareMessage)}`;
+    try {
+      const canOpen = await Linking.canOpenURL(waUrl);
+      if (canOpen) {
+        await Linking.openURL(waUrl);
+      } else {
+        await Share.share({ message: shareMessage });
+      }
+    } catch {
+      await Share.share({ message: shareMessage });
+    } finally {
+      setShowWsMenu(false);
+    }
+  };
+
   const handleToggle = async (todo: Todo) => {
     const next = !todo.completed;
     setTodos(prev => prev.map(t => (t.id === todo.id ? { ...t, completed: next } : t)));
@@ -239,15 +386,21 @@ export default function HomeScreen() {
 
   const renderTodo = ({ item }: { item: Todo }) => (
     <View style={styles.todoRow}>
-      <TouchableOpacity onPress={() => handleToggle(item)} style={styles.todoCheckWrap}>
-        <View style={[styles.circle, item.completed && styles.circleDone]} />
+      <TouchableOpacity onPress={() => handleToggle(item)} style={styles.todoMainPressable} activeOpacity={0.7}>
+        <View style={styles.todoCheckWrap}>
+          <View style={[styles.circle, item.completed && styles.circleDone]} />
+        </View>
+        <Text style={[styles.todoText, item.completed && styles.todoDone]}>{item.text}</Text>
       </TouchableOpacity>
-      <Text style={[styles.todoText, item.completed && styles.todoDone]}>{item.text}</Text>
       <TouchableOpacity onPress={() => handleDeleteTodo(item.id)} style={styles.deleteBtn}>
         <Ionicons name="trash-outline" size={18} color="#555" />
       </TouchableOpacity>
     </View>
   );
+
+  const menuWidth = 230;
+  const screenWidth = Dimensions.get('window').width;
+  const menuLeft = Math.max(12, Math.min(menuPos.x - menuWidth / 2, screenWidth - menuWidth - 12));
 
   return (
     <SafeAreaView style={styles.container}>
@@ -283,6 +436,8 @@ export default function HomeScreen() {
             <TouchableOpacity
               key={ws.id}
               onPress={() => setSelectedWsId(ws.id)}
+              onLongPress={(ev) => openWorkspaceMenu(ws, ev)}
+              delayLongPress={300}
               style={[styles.tab, selectedWsId === ws.id && styles.tabActive]}
             >
               <Text style={[styles.tabText, selectedWsId === ws.id && styles.tabTextActive]}>
@@ -351,7 +506,7 @@ export default function HomeScreen() {
             <Text style={styles.inputLabel}>Name</Text>
             <TextInput
               style={styles.input}
-              placeholder="Enter workspace ID"
+              placeholder="Enter workspace nickname"
               placeholderTextColor="#444"
               value={cName}
               onChangeText={setCName}
@@ -506,6 +661,112 @@ export default function HomeScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      {/* ── WORKSPACE ACTION MENU ── */}
+      <Modal
+        visible={showWsMenu}
+        transparent
+        animationType="fade"
+        onRequestClose={closeWsMenu}
+      >
+        <Pressable style={styles.wsMenuOverlay} onPress={closeWsMenu}>
+          <View style={[styles.wsMenuCard, { left: menuLeft, top: menuPos.y + 10, width: menuWidth }]}>
+            <Text style={styles.wsMenuTitle}>{menuWs?.name ?? 'Workspace'}</Text>
+            <Text style={styles.wsMenuSubTitle}>Workspace ID: {menuWs?.id ?? '-'}</Text>
+            <TouchableOpacity style={styles.wsMenuItem} onPress={handleShareWorkspace}>
+              <Text style={styles.wsMenuItemText}>Share (WhatsApp)</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.wsMenuItem} onPress={openEditWorkspace}>
+              <Text style={styles.wsMenuItemText}>Rename / Edit</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.wsMenuItem} onPress={handleToggleWorkspaceVisibility}>
+              <Text style={styles.wsMenuItemText}>
+                {menuWs?.is_public ? 'Make Private' : 'Make Public'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.wsMenuItem} onPress={handleDeleteWorkspace}>
+              <Text style={[styles.wsMenuItemText, styles.wsMenuDanger]}>Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </Pressable>
+      </Modal>
+
+      {/* ── EDIT WORKSPACE MODAL ── */}
+      <Modal
+        visible={showEditWs}
+        transparent
+        animationType="fade"
+        onRequestClose={closeEditWorkspace}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.overlay}
+        >
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeEditWorkspace} />
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Manage Workspace</Text>
+              <TouchableOpacity onPress={closeEditWorkspace}>
+                <Text style={styles.modalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.inputLabel}>Name</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Workspace name"
+              placeholderTextColor="#444"
+              value={editName}
+              onChangeText={setEditName}
+            />
+
+            <Text style={styles.inputLabel}>Visibility</Text>
+            <View style={styles.visibilityRow}>
+              <TouchableOpacity
+                style={[styles.visibilityPill, !editPublic && styles.visibilityPillActive]}
+                onPress={() => setEditPublic(false)}
+              >
+                <Text style={[styles.visibilityPillText, !editPublic && styles.visibilityPillTextActive]}>
+                  Private
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.visibilityPill, editPublic && styles.visibilityPillActive]}
+                onPress={() => setEditPublic(true)}
+              >
+                <Text style={[styles.visibilityPillText, editPublic && styles.visibilityPillTextActive]}>
+                  Public
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {!editPublic && (
+              <>
+                <Text style={styles.inputLabel}>Password</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Optional password"
+                  placeholderTextColor="#444"
+                  value={editPassword}
+                  onChangeText={setEditPassword}
+                  secureTextEntry
+                />
+              </>
+            )}
+
+            <TouchableOpacity
+              style={[styles.primaryBtn, (!editName.trim() || wsActionLoading) && styles.primaryBtnDisabled]}
+              onPress={handleUpdateWorkspace}
+              disabled={!editName.trim() || wsActionLoading}
+            >
+              {wsActionLoading
+                ? <ActivityIndicator color="#000" />
+                : <Text style={styles.primaryBtnText}>Save Changes</Text>
+              }
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -574,6 +835,42 @@ const styles = StyleSheet.create({
   tabTextActive: {
     color: '#fff',
   },
+  wsMenuOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.2)',
+  },
+  wsMenuCard: {
+    position: 'absolute',
+    backgroundColor: '#1a1a1a',
+    borderWidth: 1,
+    borderColor: '#2b2b2b',
+    borderRadius: 10,
+    paddingVertical: 8,
+    overflow: 'hidden',
+  },
+  wsMenuTitle: {
+    color: '#9a9a9a',
+    fontSize: 12,
+    paddingHorizontal: 12,
+    paddingBottom: 2,
+  },
+  wsMenuSubTitle: {
+    color: '#777',
+    fontSize: 12,
+    paddingHorizontal: 12,
+    paddingBottom: 8,
+  },
+  wsMenuItem: {
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+  },
+  wsMenuItemText: {
+    color: '#e6e6e6',
+    fontSize: 14,
+  },
+  wsMenuDanger: {
+    color: '#e05c5c',
+  },
   tasksCard: {
     flex: 1,
     marginHorizontal: 16,
@@ -589,6 +886,11 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#1c1c1c',
+  },
+  todoMainPressable: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
   },
   todoCheckWrap: {
     marginRight: 10,
@@ -725,6 +1027,32 @@ const styles = StyleSheet.create({
   selectDivider: {
     height: 1,
     backgroundColor: '#222',
+  },
+  visibilityRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 14,
+  },
+  visibilityPill: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#2a2a2a',
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+    backgroundColor: '#101010',
+  },
+  visibilityPillActive: {
+    backgroundColor: '#fff',
+    borderColor: '#fff',
+  },
+  visibilityPillText: {
+    color: '#bbb',
+    fontSize: 14,
+  },
+  visibilityPillTextActive: {
+    color: '#000',
+    fontWeight: '600',
   },
   primaryBtn: {
     backgroundColor: '#fff',
